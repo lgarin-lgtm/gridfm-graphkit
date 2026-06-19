@@ -3,6 +3,32 @@ from torch_geometric.nn import GPSConv, GINEConv
 from torch import nn
 import torch
 
+class MCGPSConv(GPSConv):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.mc_dropout = False
+
+    @property
+    def training(self):
+        return self._training or getattr(self, "mc_dropout", False)
+
+    @training.setter
+    def training(self, value):
+        self._training = value
+
+
+class MCDropout(nn.Dropout):
+    def __init__(self, p=0.5, inplace=False):
+        super().__init__(p=p, inplace=inplace)
+        self.mc_dropout = False
+
+    @property
+    def training(self):
+        return self._training or getattr(self, "mc_dropout", False)
+
+    @training.setter
+    def training(self, value):
+        self._training = value
 
 @MODELS_REGISTRY.register("GPSTransformer")
 class GPSTransformer(nn.Module):
@@ -105,6 +131,17 @@ class GPSTransformer(nn.Module):
                 requires_grad=False,
             )
 
+    @property
+    def mc_dropout(self) -> bool:
+        return getattr(self, "_mc_dropout", False)
+
+    @mc_dropout.setter
+    def mc_dropout(self, value: bool):
+        self._mc_dropout = value
+        for m in self.modules():
+            if hasattr(m, "mc_dropout") and m is not self:
+                m.mc_dropout = value
+
     def forward(self, x, pe, edge_index, edge_attr, batch):
         """
         Forward pass for the GPSTransformer.
@@ -135,6 +172,9 @@ class GPSTransformer(nn.Module):
             x = layer["norm"](x)
 
         x = self.pre_decoder_norm(x)
-        x = self.decoder(x)
+        x = self.decoder[0](x)
+        x = self.decoder[1](x)
+        x = self.decoder_dropout(x)
+        x = self.decoder[2](x)
 
         return x

@@ -240,15 +240,34 @@ class FeatureReconstructionTask(L.LightningModule):
         return
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
-        output, _ = self.shared_step(batch)
-        output_denorm = self.node_normalizers[dataloader_idx].inverse_transform(output)
+        
 
-        # Masks for node types
-        mask_PQ = (batch.x[:, PQ] == 1).cpu()
-        mask_PV = (batch.x[:, PV] == 1).cpu()
-        mask_REF = (batch.x[:, REF] == 1).cpu()
+        # Read the number of MC samples from your config (default to 10 if not defined)
+        num_mc_samples = getattr(self.args.training, "num_mc_samples", 10)
 
-        # Count buses and generate per-node scenario_id
+        outputs = []
+        
+        # Enable MC dropout on the model
+        if hasattr(self.model, "mc_dropout"):
+            self.model.mc_dropout = True
+        
+        try:
+            for _ in range(num_mc_samples):
+                output, _ = self.shared_step(batch)
+                output_denorm = self.node_normalizers[dataloader_idx].inverse_transform(output)
+                outputs.append(output_denorm.unsqueeze(0))  # Shape: [1, num_nodes, output_dim]
+        finally:
+            if hasattr(self.model, "mc_dropout"):
+                self.model.mc_dropout = False
+        
+        # Stack samples: [num_mc_samples, num_nodes, output_dim]
+        outputs = torch.cat(outputs, dim=0)
+        
+        # Calculate summary statistics across MC iterations
+        mean_output = outputs.mean(dim=0)
+        std_output = outputs.std(dim=0)  # Epistemic/Predictive uncertainty
+
+        # Count buses and generate per-node scenario_id (original pipeline logic)
         bus_counts = batch.batch.unique(return_counts=True)[1]
         scenario_ids = batch.scenario_id  # shape: [num_graphs]
         scenario_per_node = torch.cat(
@@ -261,10 +280,9 @@ class FeatureReconstructionTask(L.LightningModule):
         bus_numbers = np.concatenate([np.arange(count.item()) for count in bus_counts])
 
         return {
-            "output": output_denorm.cpu().numpy(),
-            "mask_PQ": mask_PQ,
-            "mask_PV": mask_PV,
-            "mask_REF": mask_REF,
+            "output": mean_output.cpu().numpy(),
+            "output_mean": mean_output.cpu().numpy(),
+            "output_std": std_output.cpu().numpy(),  # Exposes prediction uncertainty
             "scenario_id": scenario_per_node,
             "bus_number": bus_numbers,
         }
