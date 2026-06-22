@@ -84,100 +84,165 @@ class GridDatasetDisk(Dataset):
         pass
 
     def process(self):
-        node_df = pd.read_csv(osp.join(self.raw_dir, "pf_node.csv"))
-        edge_df = pd.read_csv(osp.join(self.raw_dir, "pf_edge.csv"))
+        node_csv = osp.join(self.raw_dir, "pf_node.csv")
+        edge_csv = osp.join(self.raw_dir, "pf_edge.csv")
 
-        # Check the unique scenarios available
-        scenarios = node_df["scenario"].unique()
-        # Ensure node and edge data match
-        if not (scenarios == edge_df["scenario"].unique()).all():
-            raise ValueError("Mismatch between node and edge scenario values.")
+        cols_to_normalize_node = ["Pd", "Qd", "Pg", "Qg", "Vm", "Va"]
+        cols_to_normalize_edge = ["G", "B"]
 
-        # normalize node attributes
-        cols_to_normalize = ["Pd", "Qd", "Pg", "Qg", "Vm", "Va"]
-        to_normalize = torch.tensor(
-            node_df[cols_to_normalize].values,
-            dtype=torch.float,
-        )
-        self.node_stats = self.node_normalizer.fit(to_normalize)
-        node_df[cols_to_normalize] = self.node_normalizer.transform(
-            to_normalize,
-        ).numpy()
+        # ==========================================
+        # PASS 1: ITERATIVE NORMALIZATION STATS
+        # ==========================================
+        print("Pass 1: Iteratively calculating normalizer statistics...")
+        
+        node_count = 0
+        node_min, node_max, node_sum, node_sum_sq = None, None, None, None
+        baseMVA_max = 0.0
 
-        # normalize edge attributes
-        cols_to_normalize = ["G", "B"]
-        to_normalize = torch.tensor(
-            edge_df[cols_to_normalize].values,
-            dtype=torch.float,
-        )
-        if isinstance(self.node_normalizer, BaseMVANormalizer):
-            self.edge_stats = self.edge_normalizer.fit(
-                to_normalize,
-                self.node_normalizer.baseMVA,
-            )
-        else:
-            self.edge_stats = self.edge_normalizer.fit(to_normalize)
-        edge_df[cols_to_normalize] = self.edge_normalizer.transform(
-            to_normalize,
-        ).numpy()
+        for chunk in pd.read_csv(node_csv, usecols=cols_to_normalize_node, chunksize=100_000):
+            t = torch.tensor(chunk.values, dtype=torch.float32)
+            n = t.shape[0]
+            node_count += n
+            
+            if node_min is None:
+                node_min = t.min(dim=0)[0]
+                node_max = t.max(dim=0)[0]
+                node_sum = t.sum(dim=0)
+                node_sum_sq = (t ** 2).sum(dim=0)
+            else:
+                node_min = torch.min(node_min, t.min(dim=0)[0])
+                node_max = torch.max(node_max, t.max(dim=0)[0])
+                node_sum += t.sum(dim=0)
+                node_sum_sq += (t ** 2).sum(dim=0)
+                
+            current_baseMVA = t[:, [0, 1, 2, 3]].max().item()
+            if current_baseMVA > baseMVA_max:
+                baseMVA_max = current_baseMVA
 
-        # save stats
-        node_stats_path = osp.join(
-            self.processed_dir,
-            f"node_stats_{self.norm_method}.pt",
-        )
-        edge_stats_path = osp.join(
-            self.processed_dir,
-            f"edge_stats_{self.norm_method}.pt",
-        )
-        torch.save(self.node_stats, node_stats_path)
-        torch.save(self.edge_stats, edge_stats_path)
+        node_mean = node_sum / node_count
+        node_var = (node_sum_sq / node_count) - (node_mean ** 2)
+        node_std = torch.sqrt(torch.clamp(node_var, min=0.0))
 
-        # Create groupby objects for scenarios
-        node_groups = node_df.groupby("scenario")
-        edge_groups = edge_df.groupby("scenario")
+        node_params = {
+            "min_value": node_min, "max_value": node_max, 
+            "mean_value": node_mean, "std_value": node_std,
+            "baseMVA": baseMVA_max, "baseMVA_orig": getattr(self.node_normalizer, "baseMVA_orig", 100)
+        }
+        self.node_normalizer.fit_from_dict(node_params)
 
-        for scenario_idx in tqdm(scenarios):
-            # NODE DATA
-            node_data = node_groups.get_group(scenario_idx)
-            x = torch.tensor(
-                node_data[
-                    ["Pd", "Qd", "Pg", "Qg", "Vm", "Va", "PQ", "PV", "REF"]
-                ].values,
-                dtype=torch.float,
-            )
-            y = x[:, : self.mask_dim]
+        edge_count = 0
+        edge_min, edge_max, edge_sum, edge_sum_sq = None, None, None, None
 
-            # EDGE DATA
-            edge_data = edge_groups.get_group(scenario_idx)
-            edge_attr = torch.tensor(edge_data[["G", "B"]].values, dtype=torch.float)
-            edge_index = torch.tensor(
-                edge_data[["index1", "index2"]].values.T,
-                dtype=torch.long,
-            )
+        for chunk in pd.read_csv(edge_csv, usecols=cols_to_normalize_edge, chunksize=100_000):
+            t = torch.tensor(chunk.values, dtype=torch.float32)
+            n = t.shape[0]
+            edge_count += n
+            
+            if edge_min is None:
+                edge_min = t.min(dim=0)[0]
+                edge_max = t.max(dim=0)[0]
+                edge_sum = t.sum(dim=0)
+                edge_sum_sq = (t ** 2).sum(dim=0)
+            else:
+                edge_min = torch.min(edge_min, t.min(dim=0)[0])
+                edge_max = torch.max(edge_max, t.max(dim=0)[0])
+                edge_sum += t.sum(dim=0)
+                edge_sum_sq += (t ** 2).sum(dim=0)
 
-            # Create the Data object
-            graph_data = Data(
-                x=x,
-                edge_index=edge_index,
-                edge_attr=edge_attr,
-                y=y,
-                scenario_id=scenario_idx,
-            )
-            pe_pre_transform = AddEdgeWeights()
-            graph_data = pe_pre_transform(graph_data)
-            pe_transform = AddNormalizedRandomWalkPE(
-                walk_length=self.pe_dim,
-                attr_name="pe",
-            )
-            graph_data = pe_transform(graph_data)
-            torch.save(
-                graph_data,
-                osp.join(
-                    self.processed_dir,
-                    f"data_{self.norm_method}_{self.mask_dim}_{self.pe_dim}_index_{scenario_idx}.pt",
-                ),
-            )
+        edge_mean = edge_sum / edge_count if edge_count > 0 else 0
+        edge_var = (edge_sum_sq / edge_count) - (edge_mean ** 2) if edge_count > 0 else 0
+        edge_std = torch.sqrt(torch.clamp(edge_var, min=0.0)) if edge_count > 0 else 0
+
+        edge_params = {
+            "min_value": edge_min, "max_value": edge_max, 
+            "mean_value": edge_mean, "std_value": edge_std,
+            "baseMVA": baseMVA_max, "baseMVA_orig": getattr(self.edge_normalizer, "baseMVA_orig", 100)
+        }
+        self.edge_normalizer.fit_from_dict(edge_params)
+
+        self.node_stats = node_params
+        self.edge_stats = edge_params
+        torch.save(self.node_stats, osp.join(self.processed_dir, f"node_stats_{self.norm_method}.pt"))
+        torch.save(self.edge_stats, osp.join(self.processed_dir, f"edge_stats_{self.norm_method}.pt"))
+
+        # ==========================================
+        # PASS 2: BUFFERED SCENARIO SAVING
+        # ==========================================
+        print("Pass 2: Processing and saving scenarios iteratively...")
+        
+        node_iter = pd.read_csv(node_csv, chunksize=100_000)
+        edge_iter = pd.read_csv(edge_csv, chunksize=100_000)
+        
+        node_buffer = pd.DataFrame()
+        edge_buffer = pd.DataFrame()
+        
+        node_iter_active = True
+        edge_iter_active = True
+
+        while node_iter_active or edge_iter_active or not node_buffer.empty:
+            while len(node_buffer["scenario"].unique()) < 2 and node_iter_active:
+                try:
+                    node_buffer = pd.concat([node_buffer, next(node_iter)], ignore_index=True)
+                except StopIteration:
+                    node_iter_active = False
+
+            while len(edge_buffer["scenario"].unique()) < 2 and edge_iter_active:
+                try:
+                    edge_buffer = pd.concat([edge_buffer, next(edge_iter)], ignore_index=True)
+                except StopIteration:
+                    edge_iter_active = False
+
+            unique_nodes = node_buffer["scenario"].unique()
+            unique_edges = edge_buffer["scenario"].unique()
+
+            complete_nodes = set(unique_nodes[:-1]) if (len(unique_nodes) > 1 and node_iter_active) else set(unique_nodes)
+            complete_edges = set(unique_edges[:-1]) if (len(unique_edges) > 1 and edge_iter_active) else set(unique_edges)
+            
+            complete_scenarios = sorted(list(complete_nodes.intersection(complete_edges)))
+
+            if not complete_scenarios and not node_iter_active and not edge_iter_active:
+                complete_scenarios = sorted(list(set(unique_nodes).intersection(set(unique_edges))))
+
+            for scenario_idx in complete_scenarios:
+                node_data = node_buffer[node_buffer["scenario"] == scenario_idx].copy()
+                edge_data = edge_buffer[edge_buffer["scenario"] == scenario_idx].copy()
+
+                node_tensors = torch.tensor(node_data[cols_to_normalize_node].values, dtype=torch.float)
+                node_data[cols_to_normalize_node] = self.node_normalizer.transform(node_tensors).numpy()
+
+                edge_tensors = torch.tensor(edge_data[cols_to_normalize_edge].values, dtype=torch.float)
+                edge_data[cols_to_normalize_edge] = self.edge_normalizer.transform(edge_tensors).numpy()
+
+                x = torch.tensor(
+                    node_data[["Pd", "Qd", "Pg", "Qg", "Vm", "Va", "PQ", "PV", "REF"]].values,
+                    dtype=torch.float,
+                )
+                y = x[:, : self.mask_dim]
+
+                edge_attr = torch.tensor(edge_data[["G", "B"]].values, dtype=torch.float)
+                edge_index = torch.tensor(
+                    edge_data[["index1", "index2"]].values.T,
+                    dtype=torch.long,
+                )
+
+                graph_data = Data(
+                    x=x, edge_index=edge_index, edge_attr=edge_attr,
+                    y=y, scenario_id=scenario_idx,
+                )
+                
+                pe_pre_transform = AddEdgeWeights()
+                graph_data = pe_pre_transform(graph_data)
+                pe_transform = AddNormalizedRandomWalkPE(walk_length=self.pe_dim, attr_name="pe")
+                graph_data = pe_transform(graph_data)
+
+                torch.save(
+                    graph_data,
+                    osp.join(self.processed_dir, f"data_{self.norm_method}_{self.mask_dim}_{self.pe_dim}_index_{scenario_idx}.pt")
+                )
+
+            node_buffer = node_buffer[~node_buffer["scenario"].isin(complete_scenarios)]
+            edge_buffer = edge_buffer[~edge_buffer["scenario"].isin(complete_scenarios)]
+
         with open(osp.join(self.processed_dir, self.processed_done_file), "w") as f:
             f.write("done")
 
