@@ -41,12 +41,20 @@ def get_training_callbacks(args):
 
 
 def main_cli(args):
+    print(f"\n=====================================")
+    print(f"[{args.command.upper()}] Starting execution...")
+    print(f"=====================================\n")
+    
+    # 1. Initialize Logger
+    print(f"-> Initializing MLFlow Logger (experiment: {args.exp_name})...")
     logger = MLFlowLogger(
         save_dir=args.log_dir,
         experiment_name=args.exp_name,
         run_name=args.run_name,
     )
 
+    # 2. Load Configuration
+    print(f"-> Loading configuration from {args.config}...")
     with open(args.config, "r") as f:
         base_config = yaml.safe_load(f)
 
@@ -56,6 +64,8 @@ def main_cli(args):
     random.seed(config_args.seed)
     np.random.seed(config_args.seed)
 
+    # 3. Initialize DataModule and Model
+    print("-> Initializing DataModule (LitGridDataModule) and Model (FeatureReconstructionTask)...")
     litGrid = LitGridDataModule(config_args, args.data_path)
     model = FeatureReconstructionTask(
         config_args,
@@ -67,6 +77,8 @@ def main_cli(args):
         state_dict = torch.load(args.model_path)
         model.load_state_dict(state_dict)
 
+    # 4. Initialize Trainer
+    print("-> Initializing PyTorch Lightning Trainer...")
     trainer = L.Trainer(
         logger=logger,
         accelerator=config_args.training.accelerator,
@@ -77,14 +89,21 @@ def main_cli(args):
         max_epochs=config_args.training.epochs,
         callbacks=get_training_callbacks(config_args),
     )
+    # 5. Execute Commands
     if args.command == "train" or args.command == "finetune":
+        print(f"\n-> Starting Training (trainer.fit) for {config_args.training.epochs} epochs...")
         trainer.fit(model=model, datamodule=litGrid)
+        print("-> Training finished successfully!\n")
 
     if args.command != "predict":
+        print("\n-> Starting Testing (trainer.test)...")
         trainer.test(model=model, datamodule=litGrid)
+        print("-> Testing finished successfully!\n")
 
     if args.command == "predict":
+        print("\n-> Starting Prediction (trainer.predict)...")
         predictions = trainer.predict(model=model, datamodule=litGrid)
+        print("-> Prediction finished successfully! Processing outputs...")
         all_outputs = []
         all_mask_PQ = []
         all_mask_PV = []
