@@ -45,13 +45,17 @@ def main_cli(args):
     print(f"[{args.command.upper()}] Starting execution...")
     print(f"=====================================\n")
     
-    # 1. Initialize Logger
-    print(f"-> Initializing MLFlow Logger (experiment: {args.exp_name})...")
-    logger = MLFlowLogger(
-        save_dir=args.log_dir,
-        experiment_name=args.exp_name,
-        run_name=args.run_name,
-    )
+    # 1. Initialize Logger. predict writes its own CSV and logs nothing to
+    # MLflow, so skip the logger to avoid creating an empty run.
+    if args.command == "predict":
+        logger = False
+    else:
+        print(f"-> Initializing MLFlow Logger (experiment: {args.exp_name})...")
+        logger = MLFlowLogger(
+            save_dir=args.log_dir,
+            experiment_name=args.exp_name,
+            run_name=args.run_name,
+        )
 
     # 2. Load Configuration
     print(f"-> Loading configuration from {args.config}...")
