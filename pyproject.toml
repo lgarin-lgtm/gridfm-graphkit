@@ -40,9 +40,9 @@ classifiers = [
 
 
 dependencies = [
-    "torch>2.0",
+    "torch==2.4.0",
     "torch-geometric",
-    "mlflow",
+    "mlflow<3.13",
     "nbformat",
     "networkx",
     "numpy",
@@ -51,6 +51,7 @@ dependencies = [
     "pyyaml",
     "lightning",
     "seaborn",
+    "urllib3>=2.6.0",
 ]
 
 [project.optional-dependencies]

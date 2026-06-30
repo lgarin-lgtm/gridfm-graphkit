@@ -87,7 +87,7 @@ class GridDatasetDisk(Dataset):
         node_csv = osp.join(self.raw_dir, "pf_node.csv")
         edge_csv = osp.join(self.raw_dir, "pf_edge.csv")
 
-        cols_to_normalize_node = ["Pd", "Qd", "Pg", "Qg", "Vm", "Va"]
+        cols_to_normalize_node = ['Pd','Qd','Pg','Qg','Vm','Va']
         cols_to_normalize_edge = ["G", "B"]
 
         # ==========================================
@@ -173,8 +173,8 @@ class GridDatasetDisk(Dataset):
         node_iter = pd.read_csv(node_csv, chunksize=100_000)
         edge_iter = pd.read_csv(edge_csv, chunksize=100_000)
         
-        node_buffer = pd.DataFrame()
-        edge_buffer = pd.DataFrame()
+        node_buffer = next(node_iter)
+        edge_buffer = next(edge_iter)
         
         node_iter_active = True
         edge_iter_active = True
