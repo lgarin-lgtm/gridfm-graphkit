@@ -1,34 +1,9 @@
 from gridfm_graphkit.io.registries import MODELS_REGISTRY
-from torch_geometric.nn import GPSConv, GINEConv
+from gridfm_graphkit.models.mc import MCDropout, MCGPSConv
+from torch_geometric.nn import GINEConv
 from torch import nn
 import torch
 
-class MCGPSConv(GPSConv):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.mc_dropout = False
-
-    @property
-    def training(self):
-        return self._training or getattr(self, "mc_dropout", False)
-
-    @training.setter
-    def training(self, value):
-        self._training = value
-
-
-class MCDropout(nn.Dropout):
-    def __init__(self, p=0.5, inplace=False):
-        super().__init__(p=p, inplace=inplace)
-        self.mc_dropout = False
-
-    @property
-    def training(self):
-        return self._training or getattr(self, "mc_dropout", False)
-
-    @training.setter
-    def training(self, value):
-        self._training = value
 
 @MODELS_REGISTRY.register("GPSTransformer")
 class GPSTransformer(nn.Module):
@@ -99,7 +74,7 @@ class GPSTransformer(nn.Module):
             self.layers.append(
                 nn.ModuleDict(
                     {
-                        "conv": GPSConv(
+                        "conv": MCGPSConv(
                             channels=self.hidden_dim,
                             conv=GINEConv(nn=mlp, edge_dim=self.edge_dim),
                             heads=self.heads,
@@ -119,6 +94,8 @@ class GPSTransformer(nn.Module):
             nn.LeakyReLU(),
             nn.Linear(self.hidden_dim, self.output_dim),
         )
+        # MC-dropout head: active during training and during predict() sampling.
+        self.decoder_dropout = MCDropout(p=self.dropout)
 
         if self.learn_mask:
             self.mask_value = nn.Parameter(

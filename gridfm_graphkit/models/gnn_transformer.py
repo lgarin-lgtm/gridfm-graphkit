@@ -1,35 +1,9 @@
 from gridfm_graphkit.io.registries import MODELS_REGISTRY
-from torch_geometric.nn import TransformerConv
+from gridfm_graphkit.models.mc import MCDropout, MCTransformerConv
 from torch import nn
 import torch
 
-class MCTransformerConv(TransformerConv):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.mc_dropout = False
 
-    @property
-    def training(self):
-        return self._training or getattr(self, "mc_dropout", False)
-
-    @training.setter
-    def training(self, value):
-        self._training = value
-
-
-class MCDropout(nn.Dropout):
-    def __init__(self, p=0.5, inplace=False):
-        super().__init__(p=p, inplace=inplace)
-        self.mc_dropout = False
-
-    @property
-    def training(self):
-        return self._training or getattr(self, "mc_dropout", False)
-
-    @training.setter
-    def training(self, value):
-        self._training = value
-        
 @MODELS_REGISTRY.register("GNN_TransformerConv")
 class GNN_TransformerConv(nn.Module):
     """
@@ -62,6 +36,7 @@ class GNN_TransformerConv(nn.Module):
 
         # === Optional (had defaults originally) ===
         self.heads = getattr(args.model, "attention_head", 1)
+        self.dropout = getattr(args.model, "dropout", 0.0)
         self.mask_dim = getattr(args.data, "mask_dim", 6)
         self.mask_value = getattr(args.data, "mask_value", -1.0)
         self.learn_mask = getattr(args.data, "learn_mask", False)
@@ -71,12 +46,13 @@ class GNN_TransformerConv(nn.Module):
 
         for _ in range(self.num_layers):
             self.layers.append(
-                TransformerConv(
+                MCTransformerConv(
                     current_dim,
                     self.hidden_dim,
                     heads=self.heads,
                     edge_dim=self.edge_dim,
                     beta=False,
+                    dropout=self.dropout,  # attention dropout; MC source at inference
                 ),
             )
             # Update the dimension for the next layer
@@ -88,6 +64,8 @@ class GNN_TransformerConv(nn.Module):
             nn.LeakyReLU(),
             nn.Linear(self.hidden_dim, self.output_dim),
         )
+        # MC-dropout head: active during training and during predict() sampling.
+        self.mlps_dropout = MCDropout(p=self.dropout)
 
         if self.learn_mask:
             self.mask_value = nn.Parameter(

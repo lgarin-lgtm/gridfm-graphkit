@@ -104,7 +104,9 @@ def main_cli(args):
         print("\n-> Starting Prediction (trainer.predict)...")
         predictions = trainer.predict(model=model, datamodule=litGrid)
         print("-> Prediction finished successfully! Processing outputs...")
+        has_std = "output_std" in predictions[0]
         all_outputs = []
+        all_stds = []
         all_mask_PQ = []
         all_mask_PV = []
         all_mask_REF = []
@@ -113,6 +115,8 @@ def main_cli(args):
 
         for batch in predictions:
             all_outputs.append(batch["output"])
+            if has_std:
+                all_stds.append(batch["output_std"])
             all_mask_PQ.append(batch["mask_PQ"])
             all_mask_PV.append(batch["mask_PV"])
             all_mask_REF.append(batch["mask_REF"])
@@ -120,29 +124,32 @@ def main_cli(args):
             all_bus_numbers.append(batch["bus_number"])
 
         # Concatenate all
-        outputs = np.concatenate(all_outputs, axis=0)  # shape: [num_nodes, 6]
+        outputs = np.concatenate(all_outputs, axis=0)  # mean, shape: [num_nodes, 6]
         mask_PQ = np.concatenate(all_mask_PQ, axis=0)
         mask_PV = np.concatenate(all_mask_PV, axis=0)
         mask_REF = np.concatenate(all_mask_REF, axis=0)
         scenario_ids = np.concatenate(all_scenarios, axis=0)
         bus_numbers = np.concatenate(all_bus_numbers, axis=0)
 
-        # Build DataFrame
-        df = pd.DataFrame(
-            {
-                "scenario": scenario_ids,
-                "bus": bus_numbers,
-                "PD": outputs[:, 0],
-                "QD": outputs[:, 1],
-                "PG": outputs[:, 2],
-                "QG": outputs[:, 3],
-                "VM": outputs[:, 4],
-                "VA": outputs[:, 5],
-                "PQ": mask_PQ.astype(int),
-                "PV": mask_PV.astype(int),
-                "REF": mask_REF.astype(int),
-            },
-        )
+        # Build DataFrame. With MC dropout, add per-target std + 95% CI bounds
+        # (mean ± 1.96·std); otherwise just the deterministic mean.
+        targets = ["PD", "QD", "PG", "QG", "VM", "VA"]
+        data = {"scenario": scenario_ids, "bus": bus_numbers}
+        if has_std:
+            stds = np.concatenate(all_stds, axis=0)  # MC-dropout std, [num_nodes, 6]
+            z = 1.96  # ~95% normal-approx confidence interval
+            for i, t in enumerate(targets):
+                data[t] = outputs[:, i]
+                data[f"{t}_std"] = stds[:, i]
+                data[f"{t}_ci_low"] = outputs[:, i] - z * stds[:, i]
+                data[f"{t}_ci_high"] = outputs[:, i] + z * stds[:, i]
+        else:
+            for i, t in enumerate(targets):
+                data[t] = outputs[:, i]
+        data["PQ"] = mask_PQ.astype(int)
+        data["PV"] = mask_PV.astype(int)
+        data["REF"] = mask_REF.astype(int)
+        df = pd.DataFrame(data)
 
         # Save CSV
         output_dir = os.path.join(args.output_path)

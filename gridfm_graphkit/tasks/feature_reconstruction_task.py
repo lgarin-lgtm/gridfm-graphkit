@@ -1,9 +1,11 @@
 import torch
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import lightning as L
-from pytorch_lightning.utilities import rank_zero_only
+from lightning.pytorch.utilities import rank_zero_only
 import numpy as np
 import os
+import shutil
+import tempfile
 import pandas as pd
 
 from lightning.pytorch.loggers import MLFlowLogger
@@ -72,7 +74,9 @@ class FeatureReconstructionTask(L.LightningModule):
         self.batch_size = int(args.training.batch_size)
         self.node_normalizers = node_normalizers
         self.edge_normalizers = edge_normalizers
-        self.save_hyperparameters()
+        # Normalizer objects aren't loggable params and their repr can exceed
+        # MLflow's param-value length limit; keep only the real hyperparameters.
+        self.save_hyperparameters(ignore=["node_normalizers", "edge_normalizers"])
 
     def forward(self, x, pe, edge_index, edge_attr, batch, mask=None):
         if mask is not None:
@@ -80,34 +84,42 @@ class FeatureReconstructionTask(L.LightningModule):
             x[:, : mask.shape[1]][mask] = mask_value_expanded[mask]
         return self.model(x, pe, edge_index, edge_attr, batch)
 
-    @rank_zero_only
-    def on_fit_start(self):
-        # Determine save path
+    def _log_artifact(self, local_path, artifact_path):
+        """Log a local file to the run's artifact store.
+
+        Uses MLflow's client API so it works with any artifact store (local,
+        HTTP server, S3, ...); falls back to copying into the logger's
+        ``save_dir`` for non-MLflow loggers.
+        """
         if isinstance(self.logger, MLFlowLogger):
-            log_dir = os.path.join(
-                self.logger.save_dir,
-                self.logger.experiment_id,
+            self.logger.experiment.log_artifact(
                 self.logger.run_id,
-                "artifacts",
-                "stats",
+                local_path,
+                artifact_path=artifact_path,
             )
         else:
-            log_dir = os.path.join(self.logger.save_dir, "stats")
+            dest = os.path.join(self.logger.save_dir, artifact_path)
+            os.makedirs(dest, exist_ok=True)
+            shutil.copy(local_path, dest)
 
-        os.makedirs(log_dir, exist_ok=True)
-        log_stats_path = os.path.join(log_dir, "normalization_stats.txt")
+    @rank_zero_only
+    def on_fit_start(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            log_stats_path = os.path.join(tmp_dir, "normalization_stats.txt")
 
-        # Collect normalization stats
-        with open(log_stats_path, "w") as log_file:
-            for i, normalizer in enumerate(self.node_normalizers):
-                log_file.write(
-                    f"Node Normalizer {self.args.data.networks[i]} stats:\n{normalizer.get_stats()}\n\n",
-                )
+            # Collect normalization stats
+            with open(log_stats_path, "w") as log_file:
+                for i, normalizer in enumerate(self.node_normalizers):
+                    log_file.write(
+                        f"Node Normalizer {self.args.data.networks[i]} stats:\n{normalizer.get_stats()}\n\n",
+                    )
 
-            for i, normalizer in enumerate(self.edge_normalizers):
-                log_file.write(
-                    f"Edge Normalizer {self.args.data.networks[i]} stats:\n{normalizer.get_stats()}\n\n",
-                )
+                for i, normalizer in enumerate(self.edge_normalizers):
+                    log_file.write(
+                        f"Edge Normalizer {self.args.data.networks[i]} stats:\n{normalizer.get_stats()}\n\n",
+                    )
+
+            self._log_artifact(log_stats_path, "stats")
 
     def shared_step(self, batch):
         output = self.forward(
@@ -235,39 +247,50 @@ class FeatureReconstructionTask(L.LightningModule):
                 batch_size=batch.num_graphs,
                 add_dataloader_idx=False,
                 sync_dist=True,
-                logger=False,
+                logger=True,
             )
         return
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
-        
+        # Switch: config.model.mc_dropout toggles between MC-dropout uncertainty
+        # (mean + std over num_mc_samples stochastic passes) and a single
+        # deterministic pass. The architecture is identical either way, so the
+        # same checkpoint loads regardless of this flag.
+        use_mc = getattr(self.args.model, "mc_dropout", False) and hasattr(
+            self.model, "mc_dropout",
+        )
 
-        # Read the number of MC samples from your config (default to 10 if not defined)
-        num_mc_samples = getattr(self.args.training, "num_mc_samples", 10)
-
-        outputs = []
-        
-        # Enable MC dropout on the model
-        if hasattr(self.model, "mc_dropout"):
-            self.model.mc_dropout = True
-        
-        try:
-            for _ in range(num_mc_samples):
-                output, _ = self.shared_step(batch)
-                output_denorm = self.node_normalizers[dataloader_idx].inverse_transform(output)
-                outputs.append(output_denorm.unsqueeze(0))  # Shape: [1, num_nodes, output_dim]
-        finally:
-            if hasattr(self.model, "mc_dropout"):
+        if use_mc:
+            num_mc_samples = getattr(self.args.training, "num_mc_samples", 10)
+            if num_mc_samples < 2:
+                raise ValueError(
+                    f"num_mc_samples must be >= 2 for an std estimate, got {num_mc_samples}",
+                )
+            outputs = []
+            self.model.mc_dropout = True  # keep dropout active during inference
+            try:
+                for _ in range(num_mc_samples):
+                    output, _ = self.shared_step(batch)
+                    output_denorm = self.node_normalizers[
+                        dataloader_idx
+                    ].inverse_transform(output)
+                    outputs.append(output_denorm.unsqueeze(0))  # [1, n_nodes, dim]
+            finally:
                 self.model.mc_dropout = False
-        
-        # Stack samples: [num_mc_samples, num_nodes, output_dim]
-        outputs = torch.cat(outputs, dim=0)
-        
-        # Calculate summary statistics across MC iterations
-        mean_output = outputs.mean(dim=0)
-        std_output = outputs.std(dim=0)  # Epistemic/Predictive uncertainty
+            outputs = torch.cat(outputs, dim=0)  # [num_mc_samples, n_nodes, dim]
+            mean_output = outputs.mean(dim=0)
+            std_output = outputs.std(dim=0)  # per-bus, per-target predictive std
+        else:
+            output, _ = self.shared_step(batch)
+            mean_output = self.node_normalizers[dataloader_idx].inverse_transform(output)
+            std_output = None
 
-        # Count buses and generate per-node scenario_id (original pipeline logic)
+        # Masks for node types
+        mask_PQ = (batch.x[:, PQ] == 1).cpu()
+        mask_PV = (batch.x[:, PV] == 1).cpu()
+        mask_REF = (batch.x[:, REF] == 1).cpu()
+
+        # Count buses and generate per-node scenario_id
         bus_counts = batch.batch.unique(return_counts=True)[1]
         scenario_ids = batch.scenario_id  # shape: [num_graphs]
         scenario_per_node = torch.cat(
@@ -279,26 +302,20 @@ class FeatureReconstructionTask(L.LightningModule):
 
         bus_numbers = np.concatenate([np.arange(count.item()) for count in bus_counts])
 
-        return {
+        result = {
             "output": mean_output.cpu().numpy(),
-            "output_mean": mean_output.cpu().numpy(),
-            "output_std": std_output.cpu().numpy(),  # Exposes prediction uncertainty
+            "mask_PQ": mask_PQ,
+            "mask_PV": mask_PV,
+            "mask_REF": mask_REF,
             "scenario_id": scenario_per_node,
             "bus_number": bus_numbers,
         }
+        if std_output is not None:
+            result["output_std"] = std_output.cpu().numpy()  # predictive uncertainty
+        return result
 
     @rank_zero_only
     def on_test_end(self):
-        if isinstance(self.logger, MLFlowLogger):
-            artifact_dir = os.path.join(
-                self.logger.save_dir,
-                self.logger.experiment_id,
-                self.logger.run_id,
-                "artifacts",
-            )
-        else:
-            artifact_dir = self.logger.save_dir
-
         final_metrics = self.trainer.callback_metrics
         grouped_metrics = {}
 
@@ -355,10 +372,10 @@ class FeatureReconstructionTask(L.LightningModule):
 
             df = pd.DataFrame(data)
 
-            test_dir = os.path.join(artifact_dir, "test")
-            os.makedirs(test_dir, exist_ok=True)
-            csv_path = os.path.join(test_dir, f"{dataset}.csv")
-            df.to_csv(csv_path, index=False)
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                csv_path = os.path.join(tmp_dir, f"{dataset}.csv")
+                df.to_csv(csv_path, index=False)
+                self._log_artifact(csv_path, "test")
 
     def configure_optimizers(self):
         self.optimizer = torch.optim.Adam(
