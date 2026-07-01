@@ -1,0 +1,63 @@
+# MC-dropout fine-tune config.
+#
+# Purpose: take a checkpoint trained WITHOUT dropout (pre-`67c2c79`) and fine-tune
+# it briefly with dropout active, so MC-dropout uncertainty is calibrated.
+#
+# Run:
+#   python -m gridfm_graphkit finetune \
+#       --config examples/config/mc_finetune.yaml \
+#       --model_path <pre-dropout-checkpoint>.pt --data_path data
+#
+# THREE things that must hold:
+#  1. `model:` below MUST match the architecture that produced your checkpoint
+#     (type, *_dim, num_layers, hidden_size, attention_head). Strict
+#     load_state_dict fails otherwise. Only `dropout` is meant to differ (0 -> 0.1).
+#  2. `data.networks` = the grid(s) you fine-tune on (set to your checkpoint's).
+#  3. Success criterion is CALIBRATION, not val-RMSE: after fine-tuning, evaluate
+#     with MC sampling and check the 95% CI covers ~95% of held-out targets
+#     (examples/evaluate_reconstruction.py --num_mc_samples 20, reliability plot).
+#     Overconfident -> raise dropout (0.1->0.2) or epochs, or retrain from scratch.
+
+seed: 0                          # matches GridFM_v0_2 pretraining
+data:
+  # GridFM_v0_2 was pretrained on these 4 grids — fine-tune on the SAME
+  # distribution so this enables dropout, not domain transfer.
+  networks: ["case30_ieee", "case57_ieee", "case118_ieee"]
+  scenarios: [100000, 100000, 100000]
+  normalization: "baseMVAnorm"
+  baseMVA: 100
+  mask_type: "rnd"
+  mask_value: 0.0
+  mask_ratio: 0.5
+  mask_dim: 6
+  learn_mask: False
+  val_ratio: 0.1
+  test_ratio: 0.1
+  workers: 4
+model:                          # <-- MUST mirror the checkpoint (except dropout)
+  type: "GPSTransformer"
+  input_dim: 9
+  output_dim: 6
+  edge_dim: 2
+  pe_dim: 20
+  num_layers: 8
+  hidden_size: 256
+  attention_head: 8
+  dropout: 0.1                  # the only intended change vs the no-dropout ckpt
+training:
+  batch_size: 64                # matches GridFM_v0_2 pretraining
+  epochs: 100                    # fine-tune: short (pretraining used 500)
+  losses: ["MaskedMSE", "PBE"]
+  loss_weights: [0.01, 0.99]
+  accelerator: auto
+  devices: auto
+  strategy: auto
+optimizer:
+  learning_rate: 0.00002        # fine-tune: 5x below pretraining's 1e-4
+  beta1: 0.9
+  beta2: 0.999
+  lr_decay: 0.7
+  lr_patience: 10                # was 10
+callbacks:
+  patience: 100                  # was 100 — let early-stop actually bite in a short run
+  tol: 0

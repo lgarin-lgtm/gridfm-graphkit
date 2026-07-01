@@ -1,12 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=entrenamiento
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=10
-#SBATCH --mem=16GB
-#SBATCH --time=1:00:00
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=128GB
+#SBATCH --time=48:00:00
+#SBATCH --gres=gpu:1
 #SBATCH --partition=vicomtech
 #SBATCH --qos=qos_di13
-#SBATCH --gres=gpu:1
 #SBATCH --output=logs/output_%j.log
 #SBATCH --error=logs/error_%j.err
 #SBATCH --mail-user=lgarin@vicomtech.org
@@ -15,10 +15,10 @@
 # ponytail: -e aborta si module load / activate fallan; sin -u por el func 'module' de Lmod
 set -eo pipefail
 
-PROJECT_DIR=/Users/carmine/Code/TFMLeire/gridfm-graphkit
+PROJECT_DIR=/gpfs/VICOMTECH/proiektuak/DI13/SYSTEMICO/Carmine/gridfm-graphkit
 CONFIG="$PROJECT_DIR/examples/config/mc_finetune.yaml"
-DATA_PATH=/Users/carmine/Code/TFMLeire/gridfm-graphkit/examples/data
-MODEL_PATH=/Users/carmine/Code/TFMLeire/gridfm-graphkit/examples/models/GridFM_v0_2.pth
+DATA_PATH=/gpfs/VICOMTECH/proiektuak/DI13/SYSTEMICO/data_out
+MODEL_PATH=/gpfs/VICOMTECH/proiektuak/DI13/SYSTEMICO/Carmine/gridfm-graphkit/examples/models/GridFM_v0_2.pth
 
 # Entorno limpio + Python requerido
 #module purge
