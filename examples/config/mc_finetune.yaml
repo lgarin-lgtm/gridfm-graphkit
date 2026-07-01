@@ -22,8 +22,8 @@ seed: 0                          # matches GridFM_v0_2 pretraining
 data:
   # GridFM_v0_2 was pretrained on these 4 grids — fine-tune on the SAME
   # distribution so this enables dropout, not domain transfer.
-  networks: ["case30_ieee", "case240_pserc", "case24_ieee_rts", "case57_ieee"]
-  scenarios: [100000, 100000, 100000, 100000]
+  networks: ["case30_ieee"]
+  scenarios: [10]
   normalization: "baseMVAnorm"
   baseMVA: 100
   mask_type: "rnd"

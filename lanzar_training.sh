@@ -14,9 +14,9 @@
 # ponytail: -e aborta si module load / activate fallan; sin -u por el func 'module' de Lmod
 set -eo pipefail
 
-PROJECT_DIR=/gpfs/VICOMTECH/proiektuak/DI13/SYSTEMICO/gridfm-graphkit
-CONFIG="$PROJECT_DIR/examples/config/gridFMv0.2_pretraining.yaml"
-DATA_PATH=/gpfs/VICOMTECH/proiektuak/DI13/SYSTEMICO/data_out
+PROJECT_DIR=/home/cdellefemine/TFMLeire/gridfm-graphkit
+CONFIG="$PROJECT_DIR/examples/config/mc_finetune.yaml"
+DATA_PATH=/home/cdellefemine/TFMLeire/gridfm-graphkit/examples/data
 
 # Entorno limpio + Python requerido
 module purge
@@ -29,5 +29,5 @@ source .venv/bin/activate
 # Primera vez (crear venv + deps): python -m venv .venv && source .venv/bin/activate && pip install -e .
 
 echo "Iniciando entrenamiento..."
-gridfm_graphkit train --config "$CONFIG" --data_path "$DATA_PATH"
+gridfm_graphkit finetune --config "$CONFIG" --data_path "$DATA_PATH"
 echo "Entrenamiento finalizado."
