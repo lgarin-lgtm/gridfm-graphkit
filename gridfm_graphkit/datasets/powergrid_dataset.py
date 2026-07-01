@@ -6,8 +6,10 @@ from gridfm_graphkit.datasets.transforms import (
 
 import os.path as osp
 import os
+import bisect
 import hashlib
 import torch
+import numpy as np
 from torch_geometric.data import Data, Dataset
 import pandas as pd
 from tqdm import tqdm
@@ -20,6 +22,13 @@ from typing import Optional, Callable
 # fan them out over a process pool. The random-walk PE depends only on the graph
 # topology (edge_index + edge_weight), which repeats across scenarios, so we
 # cache it per distinct topology inside each worker.
+#
+# Scenarios are saved in shards (many scenarios per file) rather than one file
+# per scenario: at millions of scenarios, one-file-per-scenario turns into
+# millions of filesystem-metadata operations (create/open/stat), which dominates
+# wall time on shared/HPC filesystems. A shard manifest (scenario-id ranges ->
+# filename) is written once at the end of process() so get()/len() never need
+# to scan the directory.
 _W = {}  # worker-process context, set once by _init_preproc_worker
 _PE_CACHE = {}  # worker-local: topology hash -> pe tensor
 
@@ -34,6 +43,49 @@ def _resolve_num_workers():
         return max(1, len(os.sched_getaffinity(0)) - 1)  # respects SLURM cpuset
     except AttributeError:  # not Linux (e.g. macOS)
         return max(1, (os.cpu_count() or 1) - 1)
+
+
+def _resolve_shard_size():
+    """Scenarios per output file. Override via $GRIDFM_PREPROC_SHARD_SIZE."""
+    return int(os.environ.get("GRIDFM_PREPROC_SHARD_SIZE", "1000"))
+
+
+def _batched(iterable, n):
+    """Yield successive lists of up to n items from iterable."""
+    batch = []
+    for item in iterable:
+        batch.append(item)
+        if len(batch) >= n:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
+def _scenario_row_ranges(scen):
+    """Map scenario id -> (lo, hi) row-slice bounds for a buffer whose rows are
+    grouped contiguously by scenario.
+
+    Vectorized O(rows) replacement for ``df.groupby("scenario")``: find the
+    positions where the scenario id changes, and turn each contiguous run into a
+    numpy slice. Slicing the buffer's numpy columns by (lo, hi) is a view, so
+    per-scenario extraction is ~free -- the pandas groupby + per-group
+    ``df[cols].to_numpy()`` path was ~65% of preprocessing wall time.
+    """
+    n = len(scen)
+    if n == 0:
+        return {}
+    change = np.flatnonzero(scen[1:] != scen[:-1]) + 1
+    bounds = np.empty(len(change) + 2, dtype=np.int64)
+    bounds[0] = 0
+    bounds[1:-1] = change
+    bounds[-1] = n
+    ranges = {int(scen[int(bounds[i])]): (int(bounds[i]), int(bounds[i + 1])) for i in range(len(bounds) - 1)}
+    # Guard the contiguity invariant the streaming logic already relies on: a
+    # scenario split into non-adjacent runs would silently lose rows here.
+    if len(ranges) != len(bounds) - 1:
+        raise ValueError("Scenario rows are not contiguous within the CSV buffer; input must be grouped by scenario.")
+    return ranges
 
 
 def _build_graph(node6, onehot, edgeGB, edge_idx, scenario_idx, ctx):
@@ -82,13 +134,19 @@ def _init_preproc_worker(node_normalizer, edge_normalizer, pe_dim, mask_dim, nor
     _PE_CACHE.clear()
 
 
-def _build_scenario(payload):
-    """Pool worker entry point: build + save one scenario, return its id."""
-    scenario_idx, node6, onehot, edgeGB, edge_idx = payload
-    data = _build_graph(node6, onehot, edgeGB, edge_idx, scenario_idx, _W)
-    fname = f"data_{_W['norm_method']}_{_W['mask_dim']}_{_W['pe_dim']}_index_{scenario_idx}.pt"
-    torch.save(data, osp.join(_W["processed_dir"], fname))
-    return scenario_idx
+def _build_shard(payload_batch):
+    """Pool worker entry point: build + save one shard of scenarios.
+
+    Returns (start_idx, end_idx, filename, count) so the caller can assemble
+    the manifest without shipping any graph data back through the pool.
+    """
+    shard = {}
+    for scenario_idx, node6, onehot, edgeGB, edge_idx in payload_batch:
+        shard[scenario_idx] = _build_graph(node6, onehot, edgeGB, edge_idx, scenario_idx, _W)
+    start, end = payload_batch[0][0], payload_batch[-1][0]
+    fname = f"shard_{_W['norm_method']}_{_W['mask_dim']}_{_W['pe_dim']}_{start}_{end}.pt"
+    torch.save(shard, osp.join(_W["processed_dir"], fname))
+    return (start, end, fname, len(shard))
 
 
 class GridDatasetDisk(Dataset):
@@ -128,6 +186,9 @@ class GridDatasetDisk(Dataset):
         self.pe_dim = pe_dim
         self.mask_dim = mask_dim
         self.length = None
+        self._manifest = None
+        self._cached_shard_file = None
+        self._cached_shard_data = None
 
         super().__init__(root, transform, pre_transform, pre_filter)
 
@@ -152,7 +213,15 @@ class GridDatasetDisk(Dataset):
 
     @property
     def processed_done_file(self):
-        return f"processed_{self.norm_method}_{self.mask_dim}_{self.pe_dim}.done"
+        # "_sharded" distinguishes this from the old one-file-per-scenario
+        # layout, so a pre-existing processed/ dir from before shows as
+        # incomplete and gets rebuilt in the new format instead of being
+        # misread by get()/len() below.
+        return f"processed_{self.norm_method}_{self.mask_dim}_{self.pe_dim}_sharded.done"
+
+    @property
+    def shard_manifest_name(self):
+        return f"shard_index_{self.norm_method}_{self.mask_dim}_{self.pe_dim}.pt"
 
     @property
     def processed_file_names(self):
@@ -253,6 +322,11 @@ class GridDatasetDisk(Dataset):
             node_csv, edge_csv, cols_to_normalize_node, cols_to_normalize_edge,
         )
 
+        shard_size = _resolve_shard_size()
+        shard_batches = _batched(payloads, shard_size)
+        shard_ranges = []  # (start_idx, end_idx, filename)
+        total = 0
+
         if num_workers <= 1:
             ctx = {
                 "node_normalizer": self.node_normalizer,
@@ -261,12 +335,16 @@ class GridDatasetDisk(Dataset):
                 "mask_dim": self.mask_dim,
                 "pe_cache": {},
             }
-            for scenario_idx, node6, onehot, edgeGB, edge_idx in tqdm(payloads):
-                data = _build_graph(node6, onehot, edgeGB, edge_idx, scenario_idx, ctx)
-                torch.save(
-                    data,
-                    osp.join(self.processed_dir, f"data_{self.norm_method}_{self.mask_dim}_{self.pe_dim}_index_{scenario_idx}.pt"),
-                )
+            for batch in tqdm(shard_batches):
+                shard = {
+                    scenario_idx: _build_graph(node6, onehot, edgeGB, edge_idx, scenario_idx, ctx)
+                    for scenario_idx, node6, onehot, edgeGB, edge_idx in batch
+                }
+                start, end = batch[0][0], batch[-1][0]
+                fname = f"shard_{self.norm_method}_{self.mask_dim}_{self.pe_dim}_{start}_{end}.pt"
+                torch.save(shard, osp.join(self.processed_dir, fname))
+                shard_ranges.append((start, end, fname))
+                total += len(shard)
         else:
             from multiprocessing import get_context
 
@@ -279,8 +357,13 @@ class GridDatasetDisk(Dataset):
                     self.mask_dim, self.norm_method, self.processed_dir,
                 ),
             ) as pool:
-                for _ in tqdm(pool.imap_unordered(_build_scenario, payloads, chunksize=8)):
-                    pass
+                for start, end, fname, count in tqdm(pool.imap_unordered(_build_shard, shard_batches)):
+                    shard_ranges.append((start, end, fname))
+                    total += count
+
+        shard_ranges.sort()
+        manifest = {"shard_size": shard_size, "ranges": shard_ranges, "total": total}
+        torch.save(manifest, osp.join(self.processed_dir, self.shard_manifest_name))
 
         with open(osp.join(self.processed_dir, self.processed_done_file), "w") as f:
             f.write("done")
@@ -292,8 +375,12 @@ class GridDatasetDisk(Dataset):
         (the last scenario in a buffer may be split across the next chunk), then
         yields its raw arrays. Memory stays bounded to a couple of chunks.
         """
-        node_iter = pd.read_csv(node_csv, chunksize=100_000)
-        edge_iter = pd.read_csv(edge_csv, chunksize=100_000)
+        # Only parse the columns we actually use (skips e.g. the node `bus`
+        # column) -- less parse work and smaller buffers per chunk.
+        node_usecols = ["scenario", *cols_node, "PQ", "PV", "REF"]
+        edge_usecols = ["scenario", "index1", "index2", *cols_edge]
+        node_iter = pd.read_csv(node_csv, usecols=node_usecols, chunksize=100_000)
+        edge_iter = pd.read_csv(edge_csv, usecols=edge_usecols, chunksize=100_000)
         node_buffer = next(node_iter)
         edge_buffer = next(edge_iter)
         node_iter_active = True
@@ -323,44 +410,57 @@ class GridDatasetDisk(Dataset):
             if not complete_scenarios and not node_iter_active and not edge_iter_active:
                 complete_scenarios = sorted(set(unique_nodes).intersection(set(unique_edges)))
 
-            # Partition the buffer once, instead of re-scanning it per scenario.
-            node_groups = dict(tuple(node_buffer.groupby("scenario")))
-            edge_groups = dict(tuple(edge_buffer.groupby("scenario")))
+            # Convert each buffer's columns to numpy once, then hand out
+            # per-scenario slices (views) -- avoids pandas' per-group indexing
+            # machinery, which dominated wall time at scale.
+            node_scen = node_buffer["scenario"].to_numpy()
+            edge_scen = edge_buffer["scenario"].to_numpy()
+            node_feat = node_buffer[cols_node].to_numpy(dtype="float32")
+            node_onehot = node_buffer[["PQ", "PV", "REF"]].to_numpy(dtype="float32")
+            edge_gb = edge_buffer[cols_edge].to_numpy(dtype="float32")
+            edge_ij = edge_buffer[["index1", "index2"]].to_numpy().T.astype("int64")
+            node_ranges = _scenario_row_ranges(node_scen)
+            edge_ranges = _scenario_row_ranges(edge_scen)
             for scenario_idx in complete_scenarios:
-                node_data = node_groups[scenario_idx]
-                edge_data = edge_groups[scenario_idx]
+                nlo, nhi = node_ranges[int(scenario_idx)]
+                elo, ehi = edge_ranges[int(scenario_idx)]
                 yield (
                     int(scenario_idx),
-                    node_data[cols_node].to_numpy(dtype="float32"),
-                    node_data[["PQ", "PV", "REF"]].to_numpy(dtype="float32"),
-                    edge_data[cols_edge].to_numpy(dtype="float32"),
-                    edge_data[["index1", "index2"]].to_numpy().T.astype("int64"),
+                    node_feat[nlo:nhi],
+                    node_onehot[nlo:nhi],
+                    edge_gb[elo:ehi],
+                    edge_ij[:, elo:ehi],
                 )
 
             node_buffer = node_buffer[~node_buffer["scenario"].isin(complete_scenarios)]
             edge_buffer = edge_buffer[~edge_buffer["scenario"].isin(complete_scenarios)]
 
+    def _load_manifest(self):
+        if self._manifest is None:
+            manifest = torch.load(
+                osp.join(self.processed_dir, self.shard_manifest_name),
+                weights_only=False,
+            )
+            manifest["starts"] = [r[0] for r in manifest["ranges"]]
+            self._manifest = manifest
+        return self._manifest
+
     def len(self):
         if self.length is None:
-            files = [
-                f
-                for f in os.listdir(self.processed_dir)
-                if f.startswith(
-                    f"data_{self.norm_method}_{self.mask_dim}_{self.pe_dim}_index_",
-                )
-                and f.endswith(".pt")
-            ]
-            self.length = len(files)
+            self.length = self._load_manifest()["total"]
         return self.length
 
     def get(self, idx):
-        file_name = osp.join(
-            self.processed_dir,
-            f"data_{self.norm_method}_{self.mask_dim}_{self.pe_dim}_index_{idx}.pt",
-        )
-        if not osp.exists(file_name):
-            raise IndexError(f"Data file {file_name} does not exist.")
-        data = torch.load(file_name, weights_only=False)
+        manifest = self._load_manifest()
+        ranges, starts = manifest["ranges"], manifest["starts"]
+        i = bisect.bisect_right(starts, idx) - 1
+        if i < 0 or idx > ranges[i][1]:
+            raise IndexError(f"Scenario {idx} not found in processed shards.")
+        fname = ranges[i][2]
+        if self._cached_shard_file != fname:
+            self._cached_shard_data = torch.load(osp.join(self.processed_dir, fname), weights_only=False)
+            self._cached_shard_file = fname
+        data = self._cached_shard_data[idx]
         if self.transform:
             data = self.transform(data)
         return data
