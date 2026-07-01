@@ -98,6 +98,13 @@ def get_loss_function(args):
         elif loss_name == "SCE":
             loss_functions.append(SCELoss())
         elif loss_name == "PBE":
+            if args.data.normalization != "baseMVAnorm":
+                raise ValueError(
+                    "PBE loss requires normalization='baseMVAnorm': it builds "
+                    "V = Vm * exp(1j * Va), which needs Va in radians, and only "
+                    "baseMVAnorm converts Va from degrees to radians. Got "
+                    f"normalization={args.data.normalization!r}.",
+                )
             loss_functions.append(PBELoss())
         else:
             raise ValueError(f"Unknown loss function: {loss_name}")

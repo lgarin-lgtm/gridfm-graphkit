@@ -187,7 +187,13 @@ class BaseMVANormalizer(Normalizer):
             args (NestedNamespace): Parameters
 
         Attributes:
-            baseMVA (float): baseMVA found in casefile. From ``args.data.baseMVA``.
+            baseMVA_orig (float): Nominal baseMVA from the casefile. From
+                ``args.data.baseMVA`` (default 100). Only used to rebase edge
+                (G, B) admittances onto ``baseMVA`` below; never used for node P/Q.
+            baseMVA (float): The actual node P/Q normalization base: the empirical
+                max of Pd/Qd/Pg/Qg over the fit data (set by ``fit``/``fit_from_dict``,
+                not read from config). Despite the name, this is generally
+                different from ``baseMVA_orig``.
         """
         self.node_data = node_data
         self.baseMVA_orig = getattr(args.data, "baseMVA", 100)
